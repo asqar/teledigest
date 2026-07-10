@@ -168,10 +168,11 @@ def test_get_messages_for_range_honours_limit(app_config: cfg.AppConfig) -> None
 def test_build_fts_query_joins_keywords_with_or(
     app_config: cfg.AppConfig, monkeypatch
 ) -> None:
-    # Ensure we have a specific list of keywords
+    # Plain barewords are quoted as literal phrases; an explicit trailing
+    # "*" is preserved unquoted so the FTS5 prefix wildcard keeps working.
     app_config.storage.rag_keywords = ["war", "offensive", "drone*"]
     query = db.build_fts_query()
-    assert query == "war OR offensive OR drone*"
+    assert query == '"war" OR "offensive" OR drone*'
 
 
 def test_build_fts_query_returns_none_when_no_keywords(
@@ -179,6 +180,35 @@ def test_build_fts_query_returns_none_when_no_keywords(
 ) -> None:
     app_config.storage.rag_keywords = []
     assert db.build_fts_query() is None
+
+
+def test_build_fts_query_quotes_multiword_phrase(app_config: cfg.AppConfig) -> None:
+    # Unquoted, a multi-word keyword would become an implicit AND of loose
+    # tokens rather than an adjacent-phrase match.
+    app_config.storage.rag_keywords = ["адам құқығы"]
+    assert db.build_fts_query() == '"адам құқығы"'
+
+
+def test_build_fts_query_quotes_hyphenated_keyword(app_config: cfg.AppConfig) -> None:
+    # Unquoted, a hyphen can be parsed as FTS5's NOT operator and raise a
+    # MATCH syntax error.
+    app_config.storage.rag_keywords = ["көші-қон"]
+    assert db.build_fts_query() == '"көші-қон"'
+
+
+def test_build_fts_query_escapes_embedded_quotes(app_config: cfg.AppConfig) -> None:
+    app_config.storage.rag_keywords = ['say "hi"']
+    assert db.build_fts_query() == '"say ""hi"""'
+
+
+def test_build_fts_query_multiword_prefix_wildcard_is_quoted_without_star(
+    app_config: cfg.AppConfig,
+) -> None:
+    # FTS5 doesn't support wildcards inside quoted phrases, so a multi-word
+    # keyword with a trailing "*" is quoted as a literal phrase and the "*"
+    # is dropped rather than emitting invalid MATCH syntax.
+    app_config.storage.rag_keywords = ["адам құқығы*"]
+    assert db.build_fts_query() == '"адам құқығы"'
 
 
 # ---------------------------------------------------------------------------

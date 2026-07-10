@@ -214,18 +214,54 @@ def get_messages_for_day(day: dt.date, limit: int | None = None) -> list[Message
     return get_messages_for_range(start, end, limit)
 
 
+def _fts_quote(term: str) -> str:
+    """Quote *term* as a single FTS5 string literal, escaping embedded quotes."""
+    return '"{}"'.format(term.replace('"', '""'))
+
+
+def _fts_term(kw: str) -> str:
+    """
+    Turn one configured keyword into a safe FTS5 MATCH operand.
+
+    FTS5's default tokenizer splits on word boundaries (including hyphens),
+    so a bare unquoted keyword only ever matches that exact token — it does
+    *not* do substring/stem matching the way a plain Python ``in`` check
+    would. Two shapes are supported:
+
+    * Trailing ``*`` (e.g. ``"оппозиц*"``) is treated as an explicit FTS5
+      prefix query and passed through unquoted so the wildcard still works —
+      quoting would disable it. Only valid for a single bareword; a
+      multi-word keyword with a trailing ``*`` has the ``*`` stripped and is
+      quoted as a literal phrase instead, since FTS5 doesn't support
+      wildcards inside quoted phrases.
+    * Everything else (plain words, multi-word phrases, hyphenated
+      compounds) is wrapped in double quotes. This is what makes hyphenated
+      keywords like ``"көші-қон"`` and multi-word phrases like
+      ``"адам құқығы"`` safe: unquoted, a hyphen can be parsed as FTS5's NOT
+      operator and raise a MATCH syntax error, and an unquoted multi-word
+      keyword becomes an implicit AND of loose tokens rather than an
+      adjacent-phrase match.
+    """
+    if kw.endswith("*"):
+        core = kw[:-1]
+        if core and " " not in core and '"' not in core:
+            return kw
+        return _fts_quote(core)
+    return _fts_quote(kw)
+
+
 def build_fts_query() -> str | None:
     """
     Build an FTS5 MATCH query from the configured keywords.
 
     Returns:
-        A query string such as ``"war OR drone*"``, or ``None`` when no
-        keywords are configured.  Callers that receive ``None`` should fall
-        back to a full range scan rather than treating the absence of keywords
-        as an error.
+        A query string such as ``'"war" OR "offensive" OR drone*'``, or
+        ``None`` when no keywords are configured.  Callers that receive
+        ``None`` should fall back to a full range scan rather than treating
+        the absence of keywords as an error.
     """
     kws = get_config().storage.rag_keywords
-    parts = [kw.strip() for kw in kws if kw.strip()]
+    parts = [_fts_term(kw.strip()) for kw in kws if kw.strip()]
     return " OR ".join(parts) if parts else None
 
 
