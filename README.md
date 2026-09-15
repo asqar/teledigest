@@ -3,8 +3,9 @@
 [![License](https://img.shields.io/badge/licence-MIT-green)](https://opensource.org/license/mit)
 [![Build on push](https://github.com/igoropaniuk/teledigest/actions/workflows/ci.yml/badge.svg)](https://github.com/igoropaniuk/teledigest/actions/workflows/ci.yml/badge.svg)
 
-Teledigest is a framework for building Telegram bots that collect messages from channels,
-analyze them, and generate readable digests using large language models.
+Teledigest is a framework for building Telegram bots that collect messages
+from channels, analyze them, and generate readable digests using large
+language models.
 
 - **Channel ingestion**
   Scrapes messages from one or more Telegram channels using a dedicated user session.
@@ -274,7 +275,7 @@ poetry run teledigest --config teledigest.conf
 
 ### Bot Commands
 
-| Command   | Description |
+| Command   | Description                                                     |
 |-----------|-----------------------------------------------------------------|
 | `/auth`   | Authorize the user client so it can access and scrape channels  |
 | `/start`  | Alias for `/help`                                               |
