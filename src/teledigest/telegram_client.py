@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import html
+import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
@@ -51,13 +53,60 @@ user_auth_state: UserAuthState = UserAuthState.REQUIRED
 auth_dialogs: dict[int, AuthDialog] = {}
 
 SUPPORTED_COMMANDS: dict[str, str] = {
-    "/auth": "Start two-factor authentication process for the client instance",
+    "/auth": (
+        "Authorize the scraping user client (accounts with a cloud password "
+        "are authorized on the host with --auth)"
+    ),
     "/help": "Show this help message",
     "/start": "Alias for /help",
     "/today": "Generate a digest now from the last 24 hours of messages",
     "/digest": "Alias for /today",
     "/status": "Show bot status and configuration summary",
 }
+
+
+def _redact(message: str, *secrets: str) -> str:
+    """
+    Scrub user-supplied secrets out of text that is about to be sent to a chat.
+
+    Telethon error strings sometimes quote the value that was rejected, and the
+    /auth handlers echo error text back to the operator. Anything the operator
+    typed during a login dialog is treated as a secret and never echoed.
+    """
+    out = message
+    for secret in secrets:
+        for variant in {
+            secret,
+            secret.strip(),
+            "".join(ch for ch in secret if ch.isalnum() or ch == "-"),
+        }:
+            if len(variant) >= 3:
+                out = out.replace(variant, "[redacted]")
+    return out
+
+
+def auth_instructions() -> str:
+    """
+    Operator-facing instructions for the out-of-band (TTY) login.
+
+    Accounts with a cloud password (2FA) are authorized on the host rather than
+    through this chat — see the comment in auth_dialog_handler for why.
+    """
+    return (
+        f"{cross_mark} This account has a cloud password (2FA) enabled.\n\n"
+        "For safety, the cloud password is never accepted over this chat — it "
+        "would be stored in the message history of the account it protects. "
+        "Authorize on the host instead:\n\n"
+        "1. Stop the service so it releases the session file:\n"
+        "   <code>sudo systemctl stop teledigest</code>\n"
+        "2. Log in interactively (you will be prompted for phone, code, and "
+        "password; the password is read from the terminal and never stored):\n"
+        "   <code>teledigest --config /path/to/teledigest.conf --auth</code>\n"
+        "3. Start the service again:\n"
+        "   <code>sudo systemctl start teledigest</code>\n\n"
+        "Then send <code>/status</code> here to confirm the user client is "
+        "authorized."
+    )
 
 
 async def channel_message_handler(event):
@@ -160,7 +209,10 @@ async def auth_start_command(event):
 
     await event.reply(
         "Please send your phone number in international format:\n"
-        "<code>+123456789</code>",
+        "<code>+123456789</code>\n\n"
+        "<i>If this account has a cloud password (2FA), authorization is "
+        "completed on the host instead — the password is never accepted over "
+        "this chat. The bot will show you the exact steps.</i>",
         parse_mode="html",
     )
 
@@ -199,7 +251,9 @@ async def auth_dialog_handler(event):
             )
         except Exception as e:
             del auth_dialogs[chat_id]
-            await event.reply(f"{cross_mark} Failed to send code: {e}</b>")
+            await event.reply(
+                f"{cross_mark} Failed to send code: {_redact(str(e), text)}"
+            )
 
     # Code step
     elif dialog.step == AuthStep.WAIT_CODE:
@@ -220,16 +274,35 @@ async def auth_dialog_handler(event):
             await event.reply(f"{ok_mark} Authorization successful!")
 
         except SessionPasswordNeededError:
+            # DELIBERATE: there is no in-chat password step here, and adding one
+            # is not the "obvious missing feature" it looks like.
+            #
+            # The login code above is single-use and expires in minutes. A cloud
+            # (2FA) password is long-lived, reusable, and is precisely the
+            # credential that is supposed to survive a stolen session. Typing it
+            # into this chat would write it into the message history of the very
+            # account it protects, turning session theft into full account
+            # takeover. delete_messages() does not fix that: deletion is
+            # best-effort and racy, and in the exact situation where /auth is
+            # needed the bot may not be running to receive and delete it. The
+            # generic handler below also echoes exception text back into the
+            # chat, which would be a live leak path for a password.
+            #
+            # The password is handled out-of-band instead, over a TTY, by
+            # `teledigest --auth` (Telethon's client.start() prompts for it via
+            # getpass). See auth_instructions() and README "First run &
+            # authentication".
             del auth_dialogs[chat_id]
-            await event.reply(
-                f"{cross_mark} This account has a password-based 2FA enabled.\n"
-                "Password-based login is not yet supported."
-            )
+            await event.reply(auth_instructions(), parse_mode="html")
         except Exception as e:
             del auth_dialogs[chat_id]
             await event.reply(
-                f"{cross_mark} Authorization failed: {e}\n"
-                "Send <code>/auth</code> to try again."
+                f"{cross_mark} Authorization failed: "
+                # Escaped: error text is attacker/Telegram-controlled and this
+                # reply is parsed as HTML.
+                f"{html.escape(_redact(str(e), text))}\n"
+                "Send <code>/auth</code> to try again.",
+                parse_mode="html",
             )
 
 
@@ -277,7 +350,9 @@ async def status_command(event):
     if user_auth_state != UserAuthState.OK:
         text += (
             f"\n\n<b>User client:</b> {cross_mark} <b>Authorization required</b>\n"
-            "Use <code>/auth</code> to authorize the scraping account."
+            "Use <code>/auth</code> to authorize the scraping account.\n"
+            "<i>Accounts with a cloud password (2FA) are authorized on the "
+            "host with <code>teledigest --auth</code>.</i>"
         )
     else:
         text += f"\n\n<b>User client:</b> {ok_mark} Authorized"
@@ -414,8 +489,18 @@ async def start_clients(auth_only: bool = False) -> None:
     log.info("Starting user & bot clients...")
     log.info("Channels to scrape (user account): %s", ", ".join(cfg.bot.channels))
 
-    # Log in with your phone on first run in CLI mode
+    # Log in with your phone on first run in CLI mode.
+    # This is the supported path for accounts with a cloud password (2FA):
+    # Telethon's start() prompts for it via getpass, so the password is read
+    # from the terminal and never crosses a chat, a log, or the config file.
     if auth_only:
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "--auth needs an interactive terminal: it prompts for the "
+                "phone number, login code, and (if enabled) the cloud "
+                "password. Run it from a shell on the host, e.g. over ssh, or "
+                "with `docker run -it` for containers."
+            )
         await user_client.start()
         log.info("Auth-only mode: skipping channel joins and handler registration.")
         return

@@ -276,7 +276,7 @@ poetry run teledigest --config teledigest.conf
 
 | Command   | Description |
 |-----------|-----------------------------------------------------------------|
-| `/auth`   | Authorize the user client so it canto access and scrape channels|
+| `/auth`   | Authorize the user client so it can access and scrape channels  |
 | `/start`  | Alias for `/help`                                               |
 | `/help`   | Lists all supported bot commands                                |
 | `/status` | Shows parsed/relevant counts (last 24h), schedule, model, ...   |
@@ -507,13 +507,28 @@ On first run, if the user session is missing:
 - Scraping is disabled
 - `/status` explicitly shows that authorization is required
 
-### Authorizing via Telegram bot (recommended)
+### Which method to use
+
+| Account | Method |
+| --- | --- |
+| No cloud password (2FA) | `/auth` in the bot chat |
+| Cloud password (2FA) enabled | [`--auth` on the host](#cli-authorization---auth) |
+
+The cloud password is deliberately **never** accepted over the bot chat. It is
+long-lived and reusable, and a message containing it would be stored in the
+history of the very account it protects — so a stolen session would become a
+full account takeover. The login *code* is different: it is single-use and
+expires within minutes, so the chat dialog handles it. If you start `/auth` on
+an account with a cloud password, the bot stops at the code step and replies
+with the host procedure below.
+
+### Authorizing via Telegram bot
 
 Authorization can be performed interactively via bot chat dialog:
 
 1. `/auth`
 2. Send your phone number (`+123456789`)
-3. Send the 2FA code you receive.
+3. Send the login code you receive.
 
 When you authorize the user client via the `/auth` command, the bot asks you to
 type the Telegram login code with spaces between each digit, for example:
@@ -549,11 +564,28 @@ If authorization fails, repeat `/auth`.
 
 ### CLI authorization (`--auth`)
 
-It's possible to perform authentication via CLI and then exit:
+It's possible to perform authentication via CLI and then exit. This is the
+**required** method for accounts with a cloud password (2FA): the password is
+read from the terminal via `getpass`, never echoed, and never written to the
+session chat, the logs, or the config file.
 
 ```bash
 poetry run teledigest --config teledigest.conf --auth
 ```
+
+`--auth` requires an interactive terminal; it exits with an error rather than
+hanging if stdin is not a TTY.
+
+For an installed deployment (e.g. under systemd), stop the service first so it
+releases the session file, then authorize and restart:
+
+```bash
+sudo systemctl stop teledigest
+teledigest --config /path/to/teledigest.conf --auth
+sudo systemctl start teledigest
+```
+
+Confirm with `/status` in the bot chat afterwards.
 
 Or do this inside docker container:
 
@@ -621,19 +653,20 @@ There are a few reasons for that:
 3. **Clear separation of concerns**
 
    With bot-based auth, the container just runs the bot and user clients using
-   existing session files. All interactive steps (phone, code, password) happen
-   in Telegram itself, where you already expect to handle sensitive login
-   information. The container only sees the resulting session, not the raw
-   codes.
+   existing session files. The phone and login code are exchanged in Telegram
+   itself, and the container only sees the resulting session, not the raw
+   codes. The cloud password is the exception — it is never exchanged over the
+   chat (see [Which method to use](#which-method-to-use)).
 
 Because of these constraints, the recommended approach is:
 
-- use `teledigest --auth` only for **local, manual** login when you are
-  actually sitting at a terminal; or when you are deliberately managing
-  sessions outside Docker, and
-- use the `/auth` bot command for **normal Docker / production** deployments,
-  where stdin is not reliably available and the process must remain
-  non-interactive.
+- use the `/auth` bot command for **normal Docker / production** deployments of
+  accounts **without** a cloud password, where stdin is not reliably available
+  and the process must remain non-interactive;
+- use `teledigest --auth` for accounts **with** a cloud password, and for
+  local, manual login when you are actually sitting at a terminal. For
+  containers this means a one-off `docker run -it ... --auth` against the same
+  session volume.
 
 ## Contributing
 

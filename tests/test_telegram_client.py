@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -49,6 +51,16 @@ def app_config(monkeypatch) -> cfg.AppConfig:
     app_cfg = _make_app_config()
     monkeypatch.setattr(cfg, "_CONFIG", app_cfg, raising=False)
     return app_cfg
+
+
+class _FakeStdin:
+    """Stand-in for sys.stdin so tests never touch pytest's capture object."""
+
+    def __init__(self, isatty: bool) -> None:
+        self._isatty = isatty
+
+    def isatty(self) -> bool:
+        return self._isatty
 
 
 def _make_event(
@@ -554,7 +566,11 @@ async def test_auth_dialog_handler_code_step_success(monkeypatch, app_config):
 async def test_auth_dialog_handler_code_step_session_password_needed(
     monkeypatch, app_config
 ):
-    """SessionPasswordNeededError must clean up the dialog and inform the user."""
+    """SessionPasswordNeededError must hand the operator the out-of-band procedure.
+
+    By design the cloud password is never accepted over the chat, so the dialog
+    is closed rather than advanced to a password step.
+    """
     app_config.bot.allowed_users_raw = ""
 
     # Patch the name in the tc module so the except clause catches our fake class.
@@ -581,6 +597,173 @@ async def test_auth_dialog_handler_code_step_session_password_needed(
     event.reply.assert_called_once()
     reply_text = event.reply.call_args[0][0]
     assert "password" in reply_text.lower() or "2fa" in reply_text.lower()
+
+    # It must be actionable, not a dead end: the reply carries the host procedure.
+    assert "--auth" in reply_text
+    assert "systemctl" in reply_text
+
+    # And no password was ever passed to the client from the chat.
+    fake_user_client.sign_in.assert_awaited_once()
+    assert "password" not in fake_user_client.sign_in.await_args.kwargs
+
+
+# ---------------------------------------------------------------------------
+# The cloud password must never transit the bot chat (design invariant)
+# ---------------------------------------------------------------------------
+
+
+_SECRET = "hunter2-correct-horse"
+
+
+@pytest.mark.asyncio
+async def test_no_password_step_exists_in_the_auth_state_machine():
+    """There is deliberately no WAIT_PASSWORD step; see auth_dialog_handler."""
+    assert not hasattr(AuthStep, "WAIT_PASSWORD")
+    assert {s.name for s in AuthStep} == {"WAIT_PHONE", "WAIT_CODE"}
+    assert "password" not in {f.name for f in dataclasses.fields(AuthDialog)}
+
+
+@pytest.mark.asyncio
+async def test_message_after_password_required_is_ignored_entirely(
+    monkeypatch, app_config, caplog
+):
+    """A password typed after the 2FA notice reaches no client, reply, or log."""
+    app_config.bot.allowed_users_raw = ""
+    # The dialog was closed by the SessionPasswordNeededError branch.
+    monkeypatch.setattr(tc, "auth_dialogs", {})
+
+    fake_user_client = AsyncMock()
+    monkeypatch.setattr(tc, "user_client", fake_user_client)
+
+    event = _make_event(raw_text=_SECRET, chat_id=456)
+    with caplog.at_level(logging.DEBUG):
+        await tc.auth_dialog_handler(event)
+
+    event.reply.assert_not_called()
+    fake_user_client.sign_in.assert_not_called()
+    assert _SECRET not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_error_reply_redacts_the_value_the_operator_typed(
+    monkeypatch, app_config, caplog
+):
+    """Telethon error text is echoed to chat, so it must be scrubbed first."""
+    app_config.bot.allowed_users_raw = ""
+    dialogs: dict = {
+        456: AuthDialog(
+            step=AuthStep.WAIT_CODE, phone="+1234567890", phone_code_hash="h"
+        )
+    }
+    monkeypatch.setattr(tc, "auth_dialogs", dialogs)
+
+    fake_user_client = AsyncMock()
+    # Worst case: the exception quotes back exactly what was submitted.
+    fake_user_client.sign_in = AsyncMock(
+        side_effect=Exception(f"invalid value {_SECRET} rejected")
+    )
+    monkeypatch.setattr(tc, "user_client", fake_user_client)
+
+    event = _make_event(raw_text=_SECRET, chat_id=456)
+    with caplog.at_level(logging.DEBUG):
+        await tc.auth_dialog_handler(event)
+
+    reply_text = event.reply.call_args[0][0]
+    assert _SECRET not in reply_text
+    assert "[redacted]" in reply_text
+    assert _SECRET not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_error_reply_escapes_html_in_exception_text(monkeypatch, app_config):
+    """The reply is parsed as HTML, so error text must not be able to break it."""
+    app_config.bot.allowed_users_raw = ""
+    dialogs: dict = {
+        456: AuthDialog(
+            step=AuthStep.WAIT_CODE, phone="+1234567890", phone_code_hash="h"
+        )
+    }
+    monkeypatch.setattr(tc, "auth_dialogs", dialogs)
+
+    fake_user_client = AsyncMock()
+    fake_user_client.sign_in = AsyncMock(side_effect=Exception("bad <b>code</b>"))
+    monkeypatch.setattr(tc, "user_client", fake_user_client)
+
+    event = _make_event(raw_text="1 2 3 4 5", chat_id=456)
+    await tc.auth_dialog_handler(event)
+
+    reply_text = event.reply.call_args[0][0]
+    assert "&lt;b&gt;code&lt;/b&gt;" in reply_text
+    # Our own markup still survives.
+    assert "<code>/auth</code>" in reply_text
+
+
+@pytest.mark.asyncio
+async def test_phone_step_error_reply_is_redacted(monkeypatch, app_config):
+    """The same scrubbing applies to the send_code_request failure path."""
+    app_config.bot.allowed_users_raw = ""
+    dialogs: dict = {456: AuthDialog(step=AuthStep.WAIT_PHONE)}
+    monkeypatch.setattr(tc, "auth_dialogs", dialogs)
+
+    fake_user_client = AsyncMock()
+    fake_user_client.send_code_request = AsyncMock(
+        side_effect=Exception(f"bad phone {_SECRET}")
+    )
+    monkeypatch.setattr(tc, "user_client", fake_user_client)
+
+    event = _make_event(raw_text=_SECRET, chat_id=456)
+    await tc.auth_dialog_handler(event)
+
+    reply_text = event.reply.call_args[0][0]
+    assert _SECRET not in reply_text
+    assert "[redacted]" in reply_text
+
+
+def test_redact_leaves_unrelated_text_alone():
+    assert tc._redact("network unreachable", "12345") == "network unreachable"
+    # Short values are not redacted, to avoid mangling unrelated error text.
+    assert tc._redact("error 42 occurred", "42") == "error 42 occurred"
+    # The spaced-out login code is scrubbed in its normalized form too.
+    assert "[redacted]" in tc._redact("code 12345 is invalid", "1 2 3 4 5")
+
+
+def test_auth_instructions_mention_the_host_procedure():
+    text = tc.auth_instructions()
+    assert "--auth" in text
+    assert "systemctl stop teledigest" in text
+    assert "systemctl start teledigest" in text
+    assert "never accepted over this chat" in text
+
+
+# ---------------------------------------------------------------------------
+# start_clients – out-of-band auth path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_clients_auth_only_requires_a_tty(monkeypatch, app_config):
+    """Without a terminal there is nowhere to prompt for the password: fail loudly."""
+    monkeypatch.setattr(tc, "user_client", AsyncMock())
+    monkeypatch.setattr(tc, "bot_client", AsyncMock())
+    monkeypatch.setattr(tc.sys, "stdin", _FakeStdin(isatty=False))
+
+    with pytest.raises(RuntimeError) as exc:
+        await tc.start_clients(auth_only=True)
+
+    assert "interactive terminal" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_start_clients_auth_only_starts_client_on_a_tty(monkeypatch, app_config):
+    fake_user_client = AsyncMock()
+    monkeypatch.setattr(tc, "user_client", fake_user_client)
+    monkeypatch.setattr(tc, "bot_client", AsyncMock())
+    monkeypatch.setattr(tc.sys, "stdin", _FakeStdin(isatty=True))
+
+    await tc.start_clients(auth_only=True)
+
+    # Telethon's start() is what prompts for phone/code/password on the TTY.
+    fake_user_client.start.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
