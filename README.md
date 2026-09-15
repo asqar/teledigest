@@ -1,7 +1,7 @@
 # Teledigest
 
 [![License](https://img.shields.io/badge/licence-MIT-green)](https://opensource.org/license/mit)
-[![Build on push](https://github.com/igoropaniuk/teledigest/actions/workflows/ci.yml/badge.svg)](https://github.com/igoropaniuk/teledigest/actions/workflows/ci.yml/badge.svg)
+[![Build on push](https://github.com/asqar/teledigest/actions/workflows/ci.yml/badge.svg)](https://github.com/asqar/teledigest/actions/workflows/ci.yml)
 
 Teledigest is a framework for building Telegram bots that collect messages
 from channels, analyze them, and generate readable digests using large
